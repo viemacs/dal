@@ -22,10 +22,6 @@ type Model struct {
 // this maintains only one database access object for every Drivername+DataSourceName
 var connections map[string]*sql.DB = make(map[string]*sql.DB)
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-}
-
 func (model *Model) init() (err error) {
 	if model.DriverName != driverName {
 		panic(fmt.Sprintf("driver name (%s) is unknown or does not match (%s)", model.DriverName, driverName))
@@ -37,45 +33,44 @@ func (model *Model) init() (err error) {
 	conn, ok := connections[key]
 	if ok {
 		model.db = conn
-		return nil
+		return
 	}
 
 	model.db, err = sql.Open(model.DriverName, model.DataSourceName)
 	if err != nil {
-		log.Println("failed to connect database")
-		return err
+		return fmt.Errorf("%v\n dal.Init failed to connect database", err)
 	}
 	connections[key] = model.db
-	return nil
+	return
 }
 
 func (model Model) SQL(query string) (err error) {
 	if model.db == nil {
 		if err = model.init(); err != nil {
-			return err
+			return fmt.Errorf("%v\n dal.SQL failed on model.Init", err)
 		}
 	}
 
 	_, err = model.db.Exec(query)
 	if err != nil {
-		return err
+		return fmt.Errorf("%v\n dal.SQL failed on model.db.Exec", err)
 	}
-	return nil
+	return
 }
 
 func (model Model) Write(table string, values interface{}) (err error) {
 	if model.db == nil {
 		if err = model.init(); err != nil {
-			return err
+			return fmt.Errorf("%v\n dal.Write failed on model.init", err)
 		}
 	}
 
 	rows := reflect.ValueOf(values)
 	if rows.Kind() != reflect.Slice {
-		return fmt.Errorf("interface value is not a slice")
+		return fmt.Errorf("dal.Write: interface value is not a slice")
 	}
 	if rows.Len() < 1 {
-		return fmt.Errorf("interface value has NO elements")
+		return fmt.Errorf("dal.Write: interface value has NO elements")
 	}
 
 	idColumn, idField := "id", ""
@@ -110,27 +105,29 @@ func (model Model) Write(table string, values interface{}) (err error) {
 
 		stmt, err := tx.Prepare(query)
 		if err != nil {
-			log.Printf("%#v", err) // devel
+			log.Printf("%v\n dal.Write failed on transaction.Prepare", err)
+			// return fmt.Errorf("%v\n dal.Write failed on transaction.Prepare", err) // TODO
 		}
 		res, err := stmt.Exec(args...)
 		if err != nil {
 			log.Printf("failed to write a record to table %s: %v", table, err)
 			continue
+			// TODO: put errors into an error slice
 		}
 		rowsAffected, _ := res.RowsAffected()
 		sumRowsAffected += rowsAffected
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction on table %s: %v", table, err)
+		return fmt.Errorf("%v\n failed to commit transaction on table %s", err, table)
 	}
-	log.Printf("%d records are written in table %s", sumRowsAffected, table)
+	fmt.Printf("dal.Write: %d records are written in table %s", sumRowsAffected, table)
 	return nil
 }
 
 func (model *Model) Read(table string, fields []string, condition string, readType interface{}) (err error) {
 	if model.db == nil {
 		if err = model.init(); err != nil {
-			return err
+			return fmt.Errorf("%v\n dal.Read failed on model.Init", err)
 		}
 	}
 
@@ -138,8 +135,7 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 	query := fmt.Sprintf("select %s from %s %s", strings.Join(fields, ","), table, condition)
 	var rows *sql.Rows
 	if rows, err = model.db.Query(query); err != nil {
-		log.Println(err)
-		return err
+		return fmt.Errorf("%v\n dal.Read failed on model.db.Query", err)
 	}
 	defer rows.Close()
 
@@ -157,6 +153,7 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 		if err := rows.Scan(values...); err != nil {
 			log.Println(err)
 			continue
+			// TODO: put errors into an error slice
 		}
 		model.rows = append(model.rows, values)
 
@@ -172,21 +169,21 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 func (model Model) Cleanup(table, fieldTime string, tm int64) (err error) {
 	query, err := model.db.Prepare(fmt.Sprintf("delete from %s where %s < ?;", table, fieldTime))
 	if err != nil {
-		return
+		return fmt.Errorf("%v\n dal.Cleanup failed on model.db.Prepare", err)
 	}
-	if res, err := query.Exec(tm); err != nil {
-		err = fmt.Errorf("failed to cleanup outdated records in table %s, %v", table, err)
-	} else {
-		rowsAffected, _ := res.RowsAffected()
-		fmt.Printf("cleanup %d records from table %s", rowsAffected, table)
+	res, err := query.Exec(tm)
+	if err != nil {
+		return fmt.Errorf("%v\n failed to cleanup outdated records in table %s", err, table)
 	}
+	rowsAffected, _ := res.RowsAffected()
+	fmt.Printf("dal.Cleanup: cleanup %d records from table %s", rowsAffected, table)
 	return
 }
 
 func (model Model) DBInfo() (info []string) {
 	if model.db == nil {
 		if err := model.init(); err != nil {
-			return
+			panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
 		}
 	}
 
