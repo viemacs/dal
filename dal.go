@@ -58,7 +58,15 @@ func (model Model) SQL(query string) (err error) {
 	return
 }
 
+func (model Model) Insert(table string, values interface{}) (err error) {
+	return model.write(table, values, "insert|ignore")
+}
+
 func (model Model) Write(table string, values interface{}) (err error) {
+	return model.write(table, values, "insert|update")
+}
+
+func (model Model) write(table string, values interface{}, mode string) (err error) {
 	if model.db == nil {
 		if err = model.init(); err != nil {
 			return fmt.Errorf("%v\n dal.Write failed on model.init", err)
@@ -101,7 +109,14 @@ func (model Model) Write(table string, values interface{}) (err error) {
 			params = append(params, fmt.Sprintf("%v", row.FieldByName(fields[u])))
 		}
 		var query string
-		query, args = queryInsertOrUpdate(table, idColumn, idField, tags, placeholders, updates, params)
+		switch mode {
+		case "insert|ignore":
+			query, args = queryInsertOrIgnore(table, idColumn, idField, tags, placeholders, updates, params)
+		case "insert|update":
+			query, args = queryInsertOrUpdate(table, idColumn, idField, tags, placeholders, updates, params)
+		default:
+			return fmt.Errorf("unknown mode for writing records: %s", mode)
+		}
 
 		stmt, err := tx.Prepare(query)
 		if err != nil {
@@ -167,6 +182,12 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 }
 
 func (model Model) Cleanup(table, fieldTime string, tm int64) (err error) {
+	if model.db == nil {
+		if err := model.init(); err != nil {
+			panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
+		}
+	}
+
 	query, err := model.db.Prepare(fmt.Sprintf("delete from %s where %s < ?;", table, fieldTime))
 	if err != nil {
 		return fmt.Errorf("%v\n dal.Cleanup failed on model.db.Prepare", err)

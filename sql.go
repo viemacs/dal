@@ -13,6 +13,17 @@ import (
 var driverName = "mysql"
 var queryVersion = "select version();"
 
+func queryInsertOrIgnore(table, idColumn, idField string, tags, placeholders, updates []string, params []interface{}) (query string, args []interface{}) {
+
+	query = fmt.Sprintf(`insert ignore into %s(%s) values(%s);`,
+		table,
+		strings.Join(tags, ","),
+		strings.Join(placeholders, ","),
+	)
+	args = params
+	return
+}
+
 func queryInsertOrUpdate(table, idColumn, idField string, tags, placeholders, updates []string, params []interface{}) (query string, args []interface{}) {
 
 	query = fmt.Sprintf(`insert into %s(%s) values(%s) on duplicate key update %s;`,
