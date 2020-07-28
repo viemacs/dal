@@ -1,7 +1,7 @@
 DAL
 ===
 
-DAL provides a Database Access Layer in Go for MySQL and SQLite3.
+DAL provides a Database Access Layer in Go for MySQL.
 
 ## Requirements
 - Go 1.10 or higher
@@ -24,18 +24,8 @@ A model should be initialized first with connection options.
 ``` go
 model := Model{
     DriverName:     "mysql",
-    DataSourceName: "test:test@tcp(localhost)/test",
+    DataSourceName: "user:password@tcp(hostIP)/database",
 }
-```
-
-- Initialize a Model of SQLite3.
-
-``` go
-model := Model{
-    DriverName:     "sqlite3",
-    DataSourceName: "file:test.db?cache=shared&mode=memory",
-}
-
 ```
 
 - Write values to database.
@@ -75,3 +65,6 @@ Program with fail with panic if the connection to database cannot be established
 ## TODO
 1. check type of parameter `values` in Write()
 2. Read() skip passing query fields, or match query results with fields of struct.
+
+## TBConfirm
+1. 

@@ -7,9 +7,11 @@ import (
 	"log"
 	"reflect"
 	"strings"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
-// Model.Read() is not parallel-able
+// TODO: Model.Read() is not parallel-able
 // Field `Records` contains the latest query results.
 type Model struct {
 	DriverName     string
@@ -23,8 +25,9 @@ type Model struct {
 var connections map[string]*sql.DB = make(map[string]*sql.DB)
 
 func (model *Model) init() (err error) {
+	driverName := "mysql"
 	if model.DriverName != driverName {
-		panic(fmt.Sprintf("driver name (%s) is unknown or does not match (%s)", model.DriverName, driverName))
+		panic(fmt.Sprintf(`driver name (%s) is unknown or does not match "%s"`, model.DriverName, driverName))
 	}
 	if model.DataSourceName == "" {
 		return fmt.Errorf("datasource of model is not set yet")
@@ -50,93 +53,98 @@ func (model Model) SQL(query string) (err error) {
 			return fmt.Errorf("%v\n dal.SQL failed on model.Init", err)
 		}
 	}
-
-	_, err = model.db.Exec(query)
-	if err != nil {
+	if _, err = model.db.Exec(query); err != nil {
 		return fmt.Errorf("%v\n dal.SQL failed on model.db.Exec", err)
 	}
 	return
 }
 
-func (model Model) Insert(table string, values interface{}) (err error) {
-	return model.write(table, values, "insert|ignore")
+// Create does insert-ignore on the given table.
+// The values must be a non-empty slice of the same type.
+func (model Model) Create(table string, values interface{}) (rowsAffected int64, err error) {
+	return model.write(table, values, "Create")
 }
 
-func (model Model) Write(table string, values interface{}) (err error) {
-	return model.write(table, values, "insert|update")
+// Update does insert-update on the given table.
+// The values must be a non-empty slice of the same type.
+func (model Model) Update(table string, values interface{}) (rowsAffected int64, err error) {
+	return model.write(table, values, "Update")
 }
 
-func (model Model) write(table string, values interface{}, mode string) (err error) {
+func (model Model) write(table string, values interface{}, mode string) (sumRowsAffected int64, err error) {
 	if model.db == nil {
 		if err = model.init(); err != nil {
-			return fmt.Errorf("%v\n dal.Write failed on model.init", err)
+			return sumRowsAffected, fmt.Errorf("%v\n dal.Write failed on model.init", err)
 		}
 	}
 
 	rows := reflect.ValueOf(values)
 	if rows.Kind() != reflect.Slice {
-		return fmt.Errorf("dal.Write: interface value is not a slice")
+		return sumRowsAffected, fmt.Errorf("dal.%s: `values` is not a slice", mode)
 	}
 	if rows.Len() < 1 {
-		return fmt.Errorf("dal.Write: interface value has NO elements")
+		return sumRowsAffected, fmt.Errorf("dal.%s: `values` has NO elements", mode)
 	}
 
-	idColumn, idField := "id", ""
 	var fields, tags, placeholders, updates []string
 	tp := rows.Index(0).Type()
 	numField := tp.NumField()
 	for u := 0; u < numField; u++ {
-		tag := tp.Field(u).Tag.Get("field")
-		field := tp.Field(u).Name
+		field, tag := tp.Field(u).Name, tp.Field(u).Tag.Get("field")
 		if tag == "" {
 			tag = field
 		}
-		if strings.ToLower(tag) == idColumn {
-			idField = field
-		}
-		fields = append(fields, field)
-		tags = append(tags, tag)
-		placeholders = append(placeholders, "?")
-		updates = append(updates, tag+"=?")
+		fields, tags, placeholders, updates = append(fields, field),
+			append(tags, tag), append(placeholders, "?"), append(updates, tag+"=?")
 	}
 
-	var sumRowsAffected int64
+	var query string
+	switch mode {
+	case "Create": // insert|ignore
+		query = fmt.Sprintf(`insert ignore into %s(%s) values(%s);`,
+			table,
+			strings.Join(tags, ","),
+			strings.Join(placeholders, ","),
+		)
+	case "Update": // insert|update
+		query = fmt.Sprintf(`insert into %s(%s) values(%s) on duplicate key update %s;`,
+			table,
+			strings.Join(tags, ","),
+			strings.Join(placeholders, ","),
+			strings.Join(updates, ","),
+		)
+	}
+
 	tx, _ := model.db.Begin()
 	for i := 0; i < rows.Len(); i++ {
-		row := rows.Index(i)
-		var args, params []interface{}
-		for u := 0; u < numField; u++ {
-			params = append(params, fmt.Sprintf("%v", row.FieldByName(fields[u])))
-		}
-		var query string
-		switch mode {
-		case "insert|ignore":
-			query, args = queryInsertOrIgnore(table, idColumn, idField, tags, placeholders, updates, params)
-		case "insert|update":
-			query, args = queryInsertOrUpdate(table, idColumn, idField, tags, placeholders, updates, params)
-		default:
-			return fmt.Errorf("unknown mode for writing records: %s", mode)
-		}
-
 		stmt, err := tx.Prepare(query)
 		if err != nil {
-			log.Printf("%v\n dal.Write failed on transaction.Prepare", err)
-			// return fmt.Errorf("%v\n dal.Write failed on transaction.Prepare", err) // TODO
+			return sumRowsAffected, fmt.Errorf(
+				"%v\n dal.%s failed on transaction.Prepare for %s", err, mode, query)
+		}
+
+		row := rows.Index(i)
+		var params []interface{}
+		for u := 0; u < numField; u++ {
+			params = append(params, row.FieldByName(fields[u]))
+		}
+		args := params // insert|ignore
+		if mode == "Update" {
+			args = append(args, params) // insert|update
 		}
 		res, err := stmt.Exec(args...)
 		if err != nil {
-			log.Printf("failed to write a record to table %s: %v", table, err)
-			continue
-			// TODO: put errors into an error slice
+			return sumRowsAffected, fmt.Errorf(
+				"failed to write a record to table %s: %v", table, err)
 		}
 		rowsAffected, _ := res.RowsAffected()
-		sumRowsAffected += rowsAffected
+		sumRowsAffected += rowsAffected // TBConfirm
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("%v\n failed to commit transaction on table %s", err, table)
+		return sumRowsAffected, fmt.Errorf(
+			"%v\n failed to commit transaction on table %s", err, table)
 	}
-	fmt.Printf("dal.Write: %d records are written in table %s", sumRowsAffected, table)
-	return nil
+	return
 }
 
 func (model *Model) Read(table string, fields []string, condition string, readType interface{}) (err error) {
@@ -208,7 +216,7 @@ func (model Model) DBInfo() (info []string) {
 		}
 	}
 
-	rows, err := model.db.Query(queryVersion)
+	rows, err := model.db.Query("select version();")
 	if err != nil {
 		panic(err)
 		return
