@@ -74,7 +74,7 @@ func (model Model) Update(table string, values interface{}) (rowsAffected int64,
 func (model Model) write(table string, values interface{}, mode string) (sumRowsAffected int64, err error) {
 	if model.db == nil {
 		if err = model.init(); err != nil {
-			return sumRowsAffected, fmt.Errorf("%v\n dal.Write failed on model.init", err)
+			return sumRowsAffected, fmt.Errorf("%v\n dal.%s failed on model.init", err, mode)
 		}
 	}
 
@@ -86,19 +86,64 @@ func (model Model) write(table string, values interface{}, mode string) (sumRows
 		return sumRowsAffected, fmt.Errorf("dal.%s: `values` has NO elements", mode)
 	}
 
-	var fields, tags, placeholders, updates []string
-	tp := rows.Index(0).Type()
-	numField := tp.NumField()
-	for u := 0; u < numField; u++ {
-		field, tag := tp.Field(u).Name, tp.Field(u).Tag.Get("field")
-		if tag == "" {
-			tag = field
-		}
-		fields, tags, placeholders, updates = append(fields, field),
-			append(tags, tag), append(placeholders, "?"), append(updates, tag+"=?")
-	}
+	fields, query := parseValue(rows.Index(0), table, mode)
 
-	var query string
+	tx, _ := model.db.Begin()
+	for i := 0; i < rows.Len(); i++ {
+		stmt, err := tx.Prepare(query)
+		if err != nil {
+			return sumRowsAffected, fmt.Errorf(
+				"%v\n dal.%s failed on transaction.Prepare of %s", err, mode, query)
+		}
+
+		row := rows.Index(i)
+		var params []interface{}
+		for u := 0; u < len(fields); u++ {
+			params = append(params, row.FieldByName(fields[u]))
+		}
+		args := params // insert|ignore
+		if mode == "Update" {
+			args = append(args, params...) // insert|update
+		}
+		res, err := stmt.Exec(args...)
+		if err != nil {
+			return sumRowsAffected, fmt.Errorf(
+				"%v\n failed to write a record to table %s: %v\n values: %v",
+				table, err, query, args)
+		}
+		rowsAffected, _ := res.RowsAffected()
+		sumRowsAffected += rowsAffected // TBConfirm
+	}
+	if err = tx.Commit(); err != nil {
+		return sumRowsAffected, fmt.Errorf(
+			"%v\n dal.%s failed to commit transaction on table %s", err, mode, table)
+	}
+	return
+}
+
+func parseValue(rv reflect.Value, table, mode string) (fields []string, query string) {
+	var tags []string
+	var parse func(v reflect.Value)
+	parse = func(v reflect.Value) {
+		numField := v.NumField()
+		for u := 0; u < numField; u++ {
+			if v.Field(u).Kind() == reflect.Struct {
+				parse(v.Field(u))
+				continue
+			}
+			field, tag := v.Type().Field(u).Name, v.Type().Field(u).Tag.Get("field")
+			if tag == "" {
+				tag = field
+			}
+			fields, tags = append(fields, field), append(tags, tag)
+		}
+	}
+	parse(rv)
+
+	placeholders, updates := make([]string, 0, len(tags)), make([]string, 0, len(tags))
+	for _, tag := range tags {
+		placeholders, updates = append(placeholders, "?"), append(updates, tag+"=?")
+	}
 	switch mode {
 	case "Create": // insert|ignore
 		query = fmt.Sprintf(`insert ignore into %s(%s) values(%s);`,
@@ -113,36 +158,6 @@ func (model Model) write(table string, values interface{}, mode string) (sumRows
 			strings.Join(placeholders, ","),
 			strings.Join(updates, ","),
 		)
-	}
-
-	tx, _ := model.db.Begin()
-	for i := 0; i < rows.Len(); i++ {
-		stmt, err := tx.Prepare(query)
-		if err != nil {
-			return sumRowsAffected, fmt.Errorf(
-				"%v\n dal.%s failed on transaction.Prepare for %s", err, mode, query)
-		}
-
-		row := rows.Index(i)
-		var params []interface{}
-		for u := 0; u < numField; u++ {
-			params = append(params, row.FieldByName(fields[u]))
-		}
-		args := params // insert|ignore
-		if mode == "Update" {
-			args = append(args, params) // insert|update
-		}
-		res, err := stmt.Exec(args...)
-		if err != nil {
-			return sumRowsAffected, fmt.Errorf(
-				"failed to write a record to table %s: %v", table, err)
-		}
-		rowsAffected, _ := res.RowsAffected()
-		sumRowsAffected += rowsAffected // TBConfirm
-	}
-	if err := tx.Commit(); err != nil {
-		return sumRowsAffected, fmt.Errorf(
-			"%v\n failed to commit transaction on table %s", err, table)
 	}
 	return
 }
@@ -166,12 +181,12 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 	model.rows = [][]interface{}{}
 	model.Records = []interface{}{}
 
-	typ := reflect.TypeOf(readType)
-	numField := typ.NumField()
+	tp := reflect.TypeOf(readType)
+	numField := tp.NumField()
 	for rows.Next() {
 		values := make([]interface{}, numField)
 		for i := 0; i < numField; i++ {
-			values[i] = reflect.New(reflect.PtrTo(typ.Field(i).Type)).Interface()
+			values[i] = reflect.New(reflect.PtrTo(tp.Field(i).Type)).Interface()
 		}
 		if err := rows.Scan(values...); err != nil {
 			log.Println(err)
@@ -180,9 +195,9 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 		}
 		model.rows = append(model.rows, values)
 
-		elem := reflect.New(typ)
+		elem := reflect.New(tp)
 		for i := 0; i < numField; i++ {
-			elem.Elem().FieldByName(typ.Field(i).Name).Set(reflect.ValueOf(values[i]).Elem().Elem())
+			elem.Elem().FieldByName(tp.Field(i).Name).Set(reflect.ValueOf(values[i]).Elem().Elem())
 		}
 		model.Records = append(model.Records, elem.Elem().Interface())
 	}

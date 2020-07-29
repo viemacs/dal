@@ -1,6 +1,7 @@
 package dal
 
 import (
+	"reflect"
 	"testing"
 )
 
@@ -41,7 +42,7 @@ func TestModel(t *testing.T) {
 	}
 
 	// write
-	if err := model.Update("user", values); err != nil {
+	if _, err := model.Update("user", values); err != nil {
 		t.Error(err)
 	}
 
@@ -64,4 +65,29 @@ func TestModel(t *testing.T) {
 
 	// re-read
 	checkRead()
+}
+
+func Test_parseValue(t *testing.T) {
+	type being struct {
+		Name string `field:"name"`
+	}
+	type person struct {
+		being
+		Age int `field:"age"`
+	}
+	p := person{
+		being: being{
+			Name: "John",
+		},
+		Age: 12,
+	}
+	fields, query := parseValue(reflect.ValueOf(p), "staff", "Update")
+
+	tFields := []string{"Name", "Age"}
+	if len(fields) != len(tFields) || fields[0] != tFields[0] || fields[1] != tFields[1] {
+		t.Errorf("output fields %+v is different from %+v", fields, tFields)
+	}
+	if query != "insert into staff(name,age) values(?,?) on duplicate key update name=?,age=?;" {
+		t.Error("output query string is wrong")
+	}
 }

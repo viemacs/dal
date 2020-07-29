@@ -64,7 +64,13 @@ Program with fail with panic if the connection to database cannot be established
 
 ## TODO
 1. check type of parameter `values` in Write()
-2. Read() skip passing query fields, or match query results with fields of struct.
+2. `Read` function skips passing query fields, or match query results with fields of struct.
+3. Support values of nested struct in `Read` function.
 
 ## TBConfirm
-1. 
+1. sumRowsAffected: are records in database changed before tx.commit() ?
+
+## Notice
+1. Values of nested struct with duplicated fields are not supported yet.
+   During writing, the duplicated fields will generate duplicated fields in SQL.
+   During reading, only the first one of the duplicated fields will be filled.
