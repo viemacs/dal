@@ -1,6 +1,7 @@
 package dal
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -14,6 +15,13 @@ func Test_DBInfo(t *testing.T) {
 }
 
 func TestModel(t *testing.T) {
+	_ = Model{
+		DriverName:     "nil",
+		DataSourceName: "test@tcp(localhost)/test",
+	}
+}
+
+func Test_write(t *testing.T) {
 	model := Model{
 		DriverName:     "mysql",
 		DataSourceName: "test@tcp(localhost)/test",
@@ -39,11 +47,13 @@ func TestModel(t *testing.T) {
 	// version
 	if info := model.DBInfo(); len(info) != 1 {
 		t.Error("cannot get database version info")
+		return
 	}
 
 	// write
 	if _, err := model.Update("user", values); err != nil {
 		t.Error(err)
+		return
 	}
 
 	// read
@@ -51,10 +61,10 @@ func TestModel(t *testing.T) {
 		if err := model.Read("user", []string{"id", "name"}, "", T{}); err != nil {
 			t.Error(err)
 		}
-		if len(model.Records) != len(values) {
-			t.Error("length of query results and records are not the same")
+		if a, b := len(model.Records), len(values); a != b {
+			t.Errorf("length of query results (%d) != length of records (%d)", a, b)
 		}
-		for i := 0; i < len(values); i++ {
+		for i := 0; i < len(model.Records); i++ {
 			record := model.Records[i].(T)
 			if record.ID != values[i].ID || record.Name != values[i].Name {
 				t.Error("query results differs from origin values")
@@ -81,13 +91,15 @@ func Test_parseValue(t *testing.T) {
 		},
 		Age: 12,
 	}
-	fields, query := parseValue(reflect.ValueOf(p), "staff", "Update")
+	fields, query, placeholder := parseValue(reflect.ValueOf(p), "staff", "Update")
+	query = fmt.Sprintf(query, placeholder)
 
 	tFields := []string{"Name", "Age"}
 	if len(fields) != len(tFields) || fields[0] != tFields[0] || fields[1] != tFields[1] {
 		t.Errorf("output fields %+v is different from %+v", fields, tFields)
 	}
-	if query != "insert into staff(name,age) values(?,?) on duplicate key update name=?,age=?;" {
+	tQuery := "insert into staff(name,age) values (?,?) on duplicate key update name=values(name),age=values(age);"
+	if query != tQuery {
 		t.Error("output query string is wrong")
 	}
 }

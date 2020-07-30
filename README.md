@@ -62,10 +62,13 @@ if info := model.DBInfo(); len(info) != 1 {
 
 Program with fail with panic if the connection to database cannot be established. The caller of this module can recover properly.
 
-## TODO
+## Todo
 1. check type of parameter `values` in Write()
 2. `Read` function skips passing query fields, or match query results with fields of struct.
 3. Support values of nested struct in `Read` function.
+
+## Issue
+1. `Exec` accepts normal interface, but currently values are all printed into strings.
 
 ## TBConfirm
 1. sumRowsAffected: are records in database changed before tx.commit() ?

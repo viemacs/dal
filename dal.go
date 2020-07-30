@@ -13,48 +13,54 @@ import (
 
 // TODO: Model.Read() is not parallel-able
 // Field `Records` contains the latest query results.
+// Default batch size is 4K, if record-size is 4K, the max_allowed_package 16M is reached.
 type Model struct {
 	DriverName     string
 	DataSourceName string
-	db             *sql.DB
+	BatchSize      int
 	Records        []interface{}
 	rows           [][]interface{}
 }
 
-// this maintains only one database access object for every Drivername+DataSourceName
+// `connections` maintains only one database access object for every Drivername+DataSourceName
 var connections map[string]*sql.DB = make(map[string]*sql.DB)
 
-func (model *Model) init() (err error) {
+func (model *Model) getConn() (conn *sql.DB, err error) {
 	driverName := "mysql"
 	if model.DriverName != driverName {
-		panic(fmt.Sprintf(`driver name (%s) is unknown or does not match "%s"`, model.DriverName, driverName))
+		return conn, fmt.Errorf(`model.driver name "%s" is not "%s"`, model.DriverName, driverName)
 	}
 	if model.DataSourceName == "" {
-		return fmt.Errorf("datasource of model is not set yet")
+		return conn, fmt.Errorf("model.datasource is empty")
 	}
+
+	if model.BatchSize == 0 {
+		model.BatchSize = 1 << 12 // 4k
+	} else if model.BatchSize < 0 {
+		return conn, fmt.Errorf("model.Batchsize cannot be negative")
+	}
+
 	key := model.DriverName + model.DataSourceName
 	conn, ok := connections[key]
 	if ok {
-		model.db = conn
 		return
 	}
 
-	model.db, err = sql.Open(model.DriverName, model.DataSourceName)
+	conn, err = sql.Open(model.DriverName, model.DataSourceName)
 	if err != nil {
-		return fmt.Errorf("%v\n dal.Init failed to connect database", err)
+		return conn, fmt.Errorf("%v\n model.getConn failed to connect database", err)
 	}
-	connections[key] = model.db
+	connections[key] = conn
 	return
 }
 
 func (model Model) SQL(query string) (err error) {
-	if model.db == nil {
-		if err = model.init(); err != nil {
-			return fmt.Errorf("%v\n dal.SQL failed on model.Init", err)
-		}
+	conn, err := model.getConn()
+	if err != nil {
+		return fmt.Errorf("%v\n dal.SQL failed on model.getConn", err)
 	}
-	if _, err = model.db.Exec(query); err != nil {
-		return fmt.Errorf("%v\n dal.SQL failed on model.db.Exec", err)
+	if _, err = conn.Exec(query); err != nil {
+		return fmt.Errorf("%v\n dal.SQL failed on conn.Exec", err)
 	}
 	return
 }
@@ -71,57 +77,59 @@ func (model Model) Update(table string, values interface{}) (rowsAffected int64,
 	return model.write(table, values, "Update")
 }
 
-func (model Model) write(table string, values interface{}, mode string) (sumRowsAffected int64, err error) {
-	if model.db == nil {
-		if err = model.init(); err != nil {
-			return sumRowsAffected, fmt.Errorf("%v\n dal.%s failed on model.init", err, mode)
-		}
+func (model Model) write(table string, values interface{}, mode string) (rowsAffected int64, err error) {
+	conn, err := model.getConn()
+	if err != nil {
+		return rowsAffected, fmt.Errorf("%v\n dal.%s failed on model.init", err, mode)
 	}
 
 	rows := reflect.ValueOf(values)
 	if rows.Kind() != reflect.Slice {
-		return sumRowsAffected, fmt.Errorf("dal.%s: `values` is not a slice", mode)
+		return rowsAffected, fmt.Errorf("dal.%s: `values` is not a slice", mode)
 	}
 	if rows.Len() < 1 {
-		return sumRowsAffected, fmt.Errorf("dal.%s: `values` has NO elements", mode)
+		return rowsAffected, fmt.Errorf("dal.%s: `values` has NO elements", mode)
 	}
 
-	fields, query := parseValue(rows.Index(0), table, mode)
+	fields, query, placeholder := parseValue(rows.Index(0), table, mode)
+	tx, _ := conn.Begin()
+	for i := 0; i < rows.Len(); i += model.BatchSize {
+		placeholders := make([]string, 0, model.BatchSize)
+		var params []interface{}
+		for j := i; j < i+model.BatchSize && j < rows.Len(); j++ {
+			placeholders = append(placeholders, placeholder)
+			row := rows.Index(j)
+			for u := 0; u < len(fields); u++ {
+				// params = append(params, row.FieldByName(fields[u]))
+				params = append(params, fmt.Sprintf("%v", row.FieldByName(fields[u])))
+			}
+		}
 
-	tx, _ := model.db.Begin()
-	for i := 0; i < rows.Len(); i++ {
+		query = fmt.Sprintf(query, strings.Join(placeholders, ","))
 		stmt, err := tx.Prepare(query)
 		if err != nil {
-			return sumRowsAffected, fmt.Errorf(
+			return rowsAffected, fmt.Errorf(
 				"%v\n dal.%s failed on transaction.Prepare of %s", err, mode, query)
 		}
 
-		row := rows.Index(i)
-		var params []interface{}
-		for u := 0; u < len(fields); u++ {
-			params = append(params, row.FieldByName(fields[u]))
-		}
-		args := params // insert|ignore
-		if mode == "Update" {
-			args = append(args, params...) // insert|update
-		}
-		res, err := stmt.Exec(args...)
+		res, err := stmt.Exec(params...)
 		if err != nil {
-			return sumRowsAffected, fmt.Errorf(
-				"%v\n failed to write a record to table %s: %v\n values: %v",
-				table, err, query, args)
+			return rowsAffected, fmt.Errorf(
+				"%v\n model.%s failed to write a record to table %s, query: %v\n values: %v",
+				err, mode, table, query, params)
 		}
-		rowsAffected, _ := res.RowsAffected()
-		sumRowsAffected += rowsAffected // TBConfirm
+		affected, _ := res.RowsAffected()
+		rowsAffected += affected
 	}
 	if err = tx.Commit(); err != nil {
-		return sumRowsAffected, fmt.Errorf(
+		// rowsAffected is 0 if transaction failed
+		return 0, fmt.Errorf(
 			"%v\n dal.%s failed to commit transaction on table %s", err, mode, table)
 	}
 	return
 }
 
-func parseValue(rv reflect.Value, table, mode string) (fields []string, query string) {
+func parseValue(rv reflect.Value, table, mode string) (fields []string, query, placeholder string) {
 	var tags []string
 	var parse func(v reflect.Value)
 	parse = func(v reflect.Value) {
@@ -142,20 +150,20 @@ func parseValue(rv reflect.Value, table, mode string) (fields []string, query st
 
 	placeholders, updates := make([]string, 0, len(tags)), make([]string, 0, len(tags))
 	for _, tag := range tags {
-		placeholders, updates = append(placeholders, "?"), append(updates, tag+"=?")
+		placeholders = append(placeholders, "?")
+		updates = append(updates, fmt.Sprintf("%s=values(%s)", tag, tag))
 	}
+	placeholder = "(" + strings.Join(placeholders, ",") + ")"
 	switch mode {
 	case "Create": // insert|ignore
-		query = fmt.Sprintf(`insert ignore into %s(%s) values(%s);`,
+		query = fmt.Sprintf(`insert ignore into %s(%s) values %%s;`,
 			table,
 			strings.Join(tags, ","),
-			strings.Join(placeholders, ","),
 		)
 	case "Update": // insert|update
-		query = fmt.Sprintf(`insert into %s(%s) values(%s) on duplicate key update %s;`,
+		query = fmt.Sprintf(`insert into %s(%s) values %%s on duplicate key update %s;`,
 			table,
 			strings.Join(tags, ","),
-			strings.Join(placeholders, ","),
 			strings.Join(updates, ","),
 		)
 	}
@@ -163,17 +171,16 @@ func parseValue(rv reflect.Value, table, mode string) (fields []string, query st
 }
 
 func (model *Model) Read(table string, fields []string, condition string, readType interface{}) (err error) {
-	if model.db == nil {
-		if err = model.init(); err != nil {
-			return fmt.Errorf("%v\n dal.Read failed on model.Init", err)
-		}
+	conn, err := model.getConn()
+	if err != nil {
+		return fmt.Errorf("%v\n dal.Read failed on model.Init", err)
 	}
 
 	// query
 	query := fmt.Sprintf("select %s from %s %s", strings.Join(fields, ","), table, condition)
 	var rows *sql.Rows
-	if rows, err = model.db.Query(query); err != nil {
-		return fmt.Errorf("%v\n dal.Read failed on model.db.Query", err)
+	if rows, err = conn.Query(query); err != nil {
+		return fmt.Errorf("%v\n dal.Read failed on conn.Query", err)
 	}
 	defer rows.Close()
 
@@ -205,15 +212,14 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 }
 
 func (model Model) Cleanup(table, fieldTime string, tm int64) (err error) {
-	if model.db == nil {
-		if err := model.init(); err != nil {
-			panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
-		}
+	conn, err := model.getConn()
+	if err != nil {
+		panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
 	}
 
-	query, err := model.db.Prepare(fmt.Sprintf("delete from %s where %s < ?;", table, fieldTime))
+	query, err := conn.Prepare(fmt.Sprintf("delete from %s where %s < ?;", table, fieldTime))
 	if err != nil {
-		return fmt.Errorf("%v\n dal.Cleanup failed on model.db.Prepare", err)
+		return fmt.Errorf("%v\n dal.Cleanup failed on conn.Prepare", err)
 	}
 	res, err := query.Exec(tm)
 	if err != nil {
@@ -225,13 +231,12 @@ func (model Model) Cleanup(table, fieldTime string, tm int64) (err error) {
 }
 
 func (model Model) DBInfo() (info []string) {
-	if model.db == nil {
-		if err := model.init(); err != nil {
-			panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
-		}
+	conn, err := model.getConn()
+	if err != nil {
+		panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
 	}
 
-	rows, err := model.db.Query("select version();")
+	rows, err := conn.Query("select version();")
 	if err != nil {
 		panic(err)
 		return
