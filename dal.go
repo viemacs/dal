@@ -4,7 +4,6 @@ package dal
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"reflect"
 	"strings"
 
@@ -91,7 +90,7 @@ func (model Model) write(table string, values interface{}, mode string) (rowsAff
 		return rowsAffected, fmt.Errorf("dal.%s: `values` has NO elements", mode)
 	}
 
-	fields, query, placeholder := parseValue(rows.Index(0), table, mode)
+	fields, querief, placeholder := parseValue(rows.Index(0), table, mode)
 	tx, _ := conn.Begin()
 	for i := 0; i < rows.Len(); i += model.BatchSize {
 		placeholders := make([]string, 0, model.BatchSize)
@@ -105,18 +104,19 @@ func (model Model) write(table string, values interface{}, mode string) (rowsAff
 			}
 		}
 
-		query = fmt.Sprintf(query, strings.Join(placeholders, ","))
+		query := fmt.Sprintf(querief, strings.Join(placeholders, ","))
 		stmt, err := tx.Prepare(query)
 		if err != nil {
 			return rowsAffected, fmt.Errorf(
-				"%v\n dal.%s failed on transaction.Prepare of %s", err, mode, query)
+				"%v\n dal.%s failed on transaction.Prepare of %s",
+				err, mode, fmt.Sprintf(querief, placeholder+",..."))
 		}
 
 		res, err := stmt.Exec(params...)
 		if err != nil {
 			return rowsAffected, fmt.Errorf(
 				"%v\n model.%s failed to write a record to table %s, query: %v\n values: %v",
-				err, mode, table, query, params)
+				err, mode, table, fmt.Sprintf(querief, placeholder+",..."), params)
 		}
 		affected, _ := res.RowsAffected()
 		rowsAffected += affected
@@ -196,9 +196,7 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 			values[i] = reflect.New(reflect.PtrTo(tp.Field(i).Type)).Interface()
 		}
 		if err := rows.Scan(values...); err != nil {
-			log.Println(err)
-			continue
-			// TODO: put errors into an error slice
+			return fmt.Errorf("%v\n model.Scan failed", err)
 		}
 		model.rows = append(model.rows, values)
 
