@@ -91,11 +91,16 @@ func (model Model) write(table string, values interface{}, mode string) (rowsAff
 	}
 
 	fields, querief, placeholder := parseValue(rows.Index(0), table, mode)
+	step := model.Batchsize
+	valuesLimit := 1<<16 - 1 // limit of placeholders in mysql: 65,535
+	if size := valuesLimit / len(fields); size < step {
+		step = size
+	}
 	tx, _ := conn.Begin()
-	for i := 0; i < rows.Len(); i += model.BatchSize {
-		placeholders := make([]string, 0, model.BatchSize)
+	for i := 0; i < rows.Len(); i += step {
+		placeholders := make([]string, 0, step)
 		var params []interface{}
-		for j := i; j < i+model.BatchSize && j < rows.Len(); j++ {
+		for j := i; j < i+step && j < rows.Len(); j++ {
 			placeholders = append(placeholders, placeholder)
 			row := rows.Index(j)
 			for u := 0; u < len(fields); u++ {
