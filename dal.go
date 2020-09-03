@@ -53,6 +53,46 @@ func (model *Model) getConn() (conn *sql.DB, err error) {
 	return
 }
 
+func (model Model) Cleanup(table, fieldTime string, tm int64) (err error) {
+	conn, err := model.getConn()
+	if err != nil {
+		panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
+	}
+
+	query, err := conn.Prepare(fmt.Sprintf("delete from %s where %s < ?;", table, fieldTime))
+	if err != nil {
+		return fmt.Errorf("%v\n dal.Cleanup failed on conn.Prepare", err)
+	}
+	res, err := query.Exec(tm)
+	if err != nil {
+		return fmt.Errorf("%v\n failed to cleanup outdated records in table %s", err, table)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	fmt.Printf("dal.Cleanup: cleanup %d records from table %s", rowsAffected, table)
+	return
+}
+
+func (model Model) DBInfo() (info []string) {
+	conn, err := model.getConn()
+	if err != nil {
+		panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
+	}
+
+	rows, err := conn.Query("select version();")
+	if err != nil {
+		panic(err)
+		return
+	}
+	for rows.Next() {
+		var ver string
+		if err := rows.Scan(&ver); err != nil {
+			panic(fmt.Errorf("cannot get database version info, error: %v", err))
+		}
+		info = append(info, "system db version: "+ver)
+	}
+	return info
+}
+
 func (model Model) SQL(query string) (err error) {
 	conn, err := model.getConn()
 	if err != nil {
@@ -91,7 +131,7 @@ func (model Model) write(table string, values interface{}, mode string) (rowsAff
 	}
 
 	fields, querief, placeholder := parseValue(rows.Index(0), table, mode)
-	step := model.Batchsize
+	step := model.BatchSize
 	valuesLimit := 1<<16 - 1 // limit of placeholders in mysql: 65,535
 	if size := valuesLimit / len(fields); size < step {
 		step = size
@@ -181,10 +221,10 @@ func parseValue(rv reflect.Value, table, mode string) (fields []string, query, p
 	return
 }
 
-func (model *Model) Read(table string, fields []string, condition string, readType interface{}) (err error) {
+func (model *Model) ReadPlain(table string, fields []string, condition string, readType interface{}) (err error) {
 	conn, err := model.getConn()
 	if err != nil {
-		return fmt.Errorf("%v\n dal.Read failed on model.Init", err)
+		return fmt.Errorf("%v\n dal.Read failed on model.getConn", err)
 	}
 
 	// query
@@ -220,42 +260,74 @@ func (model *Model) Read(table string, fields []string, condition string, readTy
 	return nil
 }
 
-func (model Model) Cleanup(table, fieldTime string, tm int64) (err error) {
+func (model *Model) Read(table string, columns []string, condition string, v interface{}) (err error) {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Ptr {
+		return fmt.Errorf("dal.Read: target variable is not a *pointer* to slice")
+	}
+	s := rv.Elem()
+	if s.Kind() != reflect.Slice {
+		return fmt.Errorf("dal.Read: target variable is not a pointer to *slice*")
+	}
+	values := reflect.MakeSlice(s.Type(), 0, 0)
+	tp := reflect.TypeOf(v).Elem().Elem()
+
+	// query
 	conn, err := model.getConn()
 	if err != nil {
-		panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
+		return fmt.Errorf("%v\n dal.Read failed on model.getConn", err)
 	}
+	query := fmt.Sprintf("select %s from %s %s",
+		strings.Join(parseCols(reflect.New(tp).Elem(), columns), ","), table, condition)
+	var rows *sql.Rows
+	if rows, err = conn.Query(query); err != nil {
+		return fmt.Errorf("%v\n dal.Read failed on conn.Query", err)
+	}
+	defer rows.Close()
 
-	query, err := conn.Prepare(fmt.Sprintf("delete from %s where %s < ?;", table, fieldTime))
-	if err != nil {
-		return fmt.Errorf("%v\n dal.Cleanup failed on conn.Prepare", err)
+	// scan and set elements
+	for rows.Next() {
+		e := reflect.New(tp).Elem()
+		if err := rows.Scan(parseFields(e, columns)...); err != nil {
+			return fmt.Errorf("%v\n scan query results failed", err)
+		}
+		values = reflect.Append(values, e)
 	}
-	res, err := query.Exec(tm)
-	if err != nil {
-		return fmt.Errorf("%v\n failed to cleanup outdated records in table %s", err, table)
-	}
-	rowsAffected, _ := res.RowsAffected()
-	fmt.Printf("dal.Cleanup: cleanup %d records from table %s", rowsAffected, table)
+	s.Set(values)
 	return
 }
 
-func (model Model) DBInfo() (info []string) {
-	conn, err := model.getConn()
-	if err != nil {
-		panic(fmt.Errorf("%v\n dal.DBInfo failed on model.init", err))
+func parseCols(v reflect.Value, cols []string) (tags []string) {
+	_, tags = parseStruct(v, cols)
+	return
+}
+func parseFields(v reflect.Value, cols []string) (fields []interface{}) {
+	fields, _ = parseStruct(v, cols)
+	return
+}
+func parseStruct(v reflect.Value, cols []string) (fields []interface{}, tags []string) {
+	colmap := make(map[string]bool)
+	for _, c := range cols {
+		colmap[strings.ToLower(c)] = true
 	}
-
-	rows, err := conn.Query("select version();")
-	if err != nil {
-		panic(err)
-		return
-	}
-	for rows.Next() {
-		var ver string
-		if err := rows.Scan(&ver); err != nil {
-			panic(fmt.Errorf("cannot get database version info, error: %v", err))
+	fields = make([]interface{}, 0)
+	var parse func(v reflect.Value)
+	parse = func(v reflect.Value) {
+		numField := v.NumField()
+		for u := 0; u < numField; u++ {
+			if v.Field(u).Kind() == reflect.Struct {
+				parse(v.Field(u))
+				continue
+			}
+			fieldname, tag := v.Type().Field(u).Name, v.Type().Field(u).Tag.Get("field")
+			if tag == "" {
+				tag = fieldname
+			}
+			if _, ok := colmap[strings.ToLower(tag)]; ok {
+				fields, tags = append(fields, v.Field(u).Addr().Interface()), append(tags, tag)
+			}
 		}
-		info = append(info, "system db version: "+ver)
 	}
-	return info
+	parse(v)
+	return
 }

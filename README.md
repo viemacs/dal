@@ -59,6 +59,9 @@ if info := model.DBInfo(); len(info) != 1 {
 }
 ```
 
+## Features
+- supports nested structs; does not support array/slice/map as struct fields
+- supports single query; does not support multiple result sets
 
 Program with fail with panic if the connection to database cannot be established. The caller of this module can recover properly.
 

@@ -58,7 +58,25 @@ func Test_write(t *testing.T) {
 
 	// read
 	checkRead := func() {
-		if err := model.Read("user", []string{"id", "name"}, "", T{}); err != nil {
+		var users []T
+		if err := model.Read("user", []string{"id", "name"}, "", &users); err != nil {
+			t.Error(err)
+		}
+		if a, b := len(users), len(values); a != b {
+			t.Errorf("length of query results (%d) != length of records (%d)", a, b)
+		}
+		for i := 0; i < len(users); i++ {
+			record := users[i]
+			if record.ID != values[i].ID || record.Name != values[i].Name {
+				t.Error("query results differs from origin values")
+			}
+		}
+	}
+	checkRead()
+	checkRead() // re-read
+
+	checkReadPlain := func() {
+		if err := model.ReadPlain("user", []string{"id", "name"}, "", T{}); err != nil {
 			t.Error(err)
 		}
 		if a, b := len(model.Records), len(values); a != b {
@@ -71,10 +89,8 @@ func Test_write(t *testing.T) {
 			}
 		}
 	}
-	checkRead()
-
-	// re-read
-	checkRead()
+	checkReadPlain()
+	checkReadPlain() // re-read
 }
 
 func Test_parseValue(t *testing.T) {
