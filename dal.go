@@ -114,9 +114,15 @@ func (model Model) write(table string, values interface{}, mode string) (rowsAff
 
 		res, err := stmt.Exec(params...)
 		if err != nil {
+			dispLen, trailing := len(fields), ""
+			if len(params) > dispLen {
+				trailing = ",..."
+			} else {
+				dispLen = len(params)
+			}
 			return rowsAffected, fmt.Errorf(
-				"%v\n model.%s failed to write a record to table %s, query: %v\n values: %v",
-				err, mode, table, fmt.Sprintf(querief, placeholder+",..."), params)
+				"%v\n model.%s failed to write a record to table %s, query: %v\n values: %v%s",
+				err, mode, table, fmt.Sprintf(querief, placeholder+",..."), params[:dispLen], trailing)
 		}
 		affected, _ := res.RowsAffected()
 		rowsAffected += affected
